@@ -52,6 +52,9 @@
 #include <Parsers/ASTLiteral.h>
 #include <Interpreters/executeQuery.h>
 #include <IO/WriteBufferNull.h>
+#include <Parsers/ParserQuery.h>
+#include <Interpreters/InterpreterSelectQuery.h>
+#include <Interpreters/InterpreterInsertQuery.h>
 
 
 namespace DB
@@ -62,6 +65,7 @@ namespace ErrorCodes
     extern const int NO_ZOOKEEPER;
     extern const int BAD_ARGUMENTS;
     extern const int UNKNOWN_TABLE;
+    extern const int UNFINISHED;
 }
 
 
@@ -86,12 +90,6 @@ namespace
 using DatabaseAndTableName = std::pair<String, String>;
 
 
-struct TaskCluster;
-struct TaskTable;
-struct TaskShard;
-struct TaskPartition;
-
-
 enum class TaskState
 {
     Started = 0,
@@ -107,6 +105,11 @@ struct TaskStateWithOwner
 
     TaskState state{TaskState::Unknown};
     String owner;
+
+    static String getData(TaskState state, const String & owner)
+    {
+        return TaskStateWithOwner(state, owner).toString();
+    }
 
     String toString()
     {
@@ -132,25 +135,33 @@ struct TaskStateWithOwner
 };
 
 
+/// Hierarchical task description
+struct TaskPartition;
+struct TaskShard;
+struct TaskTable;
+struct TaskCluster;
+
+using TasksPartition = std::vector<TaskPartition>;
+using ShardInfo = Cluster::ShardInfo;
+using TaskShardPtr = TaskShard *;
+using TasksShard = std::vector<TaskShard>;
+using TasksShardPtrs = std::vector<TaskShard *>;
+using TasksTable = std::list<TaskTable>;
+
 struct TaskPartition
 {
     TaskPartition(TaskShard & parent, const String & name_) : task_shard(parent), name(name_) {}
 
-    String getCommonPartitionZooKeeperPath() const;
-    String getZooKeeperPath() const;
+    String getCommonPartitionPath() const;
+    String getCommonPartitionIsDirtyPath() const;
+    String getCommonPartitionActiveWorkersPath() const;
+    String getActiveWorkerPath() const;
+    String getCommonPartitionShardsPath() const;
+    String getShardStatusPath() const;
 
     TaskShard & task_shard;
     String name;
-
-    String create_query_pull;
-    ASTPtr create_query_pull_ast;
-    ASTPtr create_query_push;
 };
-
-using TasksPartition = std::vector<TaskPartition>;
-
-
-using ShardInfo = Cluster::ShardInfo;
 
 struct TaskShard
 {
@@ -163,11 +174,6 @@ struct TaskShard
 
     TasksPartition partitions;
 };
-
-using TaskShardPtr = TaskShard *;
-using TasksShard = std::vector<TaskShard>;
-using TasksShardPtrs = std::vector<TaskShard *>;
-
 
 struct TaskTable
 {
@@ -224,9 +230,6 @@ struct TaskTable
     void initShards(URNG && urng);
 };
 
-using TasksTable = std::list<TaskTable>;
-
-
 struct TaskCluster
 {
     TaskCluster(const String & task_zookeeper_path_, const Poco::Util::AbstractConfiguration & config, const String & base_key, const String & default_local_database_);
@@ -269,6 +272,8 @@ String getDatabaseDotTable(const DatabaseAndTableName & db_and_table)
     return getDatabaseDotTable(db_and_table.first, db_and_table.second);
 }
 
+
+// Creates AST representing 'ENGINE = Distributed(cluster, db, table, [sharding_key])
 std::shared_ptr<ASTStorage> createASTStorageDistributed(
     const String & cluster_name, const String & database, const String & table, const ASTPtr & sharding_key_ast = nullptr)
 {
@@ -305,19 +310,38 @@ Block getBlockWithAllStreamData(const BlockInputStreamPtr & stream)
 }
 
 
-String TaskPartition::getCommonPartitionZooKeeperPath() const
+String TaskPartition::getCommonPartitionPath() const
 {
     return task_shard.task_table.task_cluster.task_zookeeper_path                   // root
            + "/table_" + escapeForFileName(task_shard.task_table.name_in_config)    // table_test.hits
            + "/" + name;                                                            // 201701
 }
 
-String TaskPartition::getZooKeeperPath() const
+String TaskPartition::getShardStatusPath() const
 {
-    return getCommonPartitionZooKeeperPath()            // /root/table_test.hits/201701
-        + "/" + toString(task_shard.info.shard_num);    // 1 (the first shard)
+    return getCommonPartitionPath()                         // /root/table_test.hits/201701
+        + "/shards/" + toString(task_shard.info.shard_num); // 1 (the first shard)
 }
 
+String TaskPartition::getCommonPartitionShardsPath() const
+{
+    return getCommonPartitionPath() + "/shards";
+}
+
+String TaskPartition::getCommonPartitionActiveWorkersPath() const
+{
+    return getCommonPartitionPath() + "/active_workers";
+}
+
+String TaskPartition::getActiveWorkerPath() const
+{
+    return getCommonPartitionActiveWorkersPath() + "/partition_workers/" + toString(task_shard.info.shard_num);
+}
+
+String TaskPartition::getCommonPartitionIsDirtyPath() const
+{
+    return getCommonPartitionPath() + "/is_dirty";
+}
 
 TaskTable::TaskTable(TaskCluster & parent, const Poco::Util::AbstractConfiguration & config, const String & prefix_,
                      const String & table_key)
@@ -481,6 +505,10 @@ public:
         settings_pull.max_block_size = std::min(8192UL, settings_pull.max_block_size.value);
         settings_pull.preferred_block_size_bytes = 0;
 
+        Settings & settings_push = task_cluster->settings_push;
+        settings_push.insert_distributed_timeout = 0;
+        settings_push.insert_distributed_sync = 1;
+
         /// Set up clusters
         context.setClustersConfig(task_cluster_config, task_cluster->clusters_prefix);
 
@@ -572,9 +600,7 @@ protected:
             {
                 LOG_DEBUG(log, "Too many workers (" << stat.numChildren << ", maximum " << task_cluster->max_workers << ")"
                     << ". Postpone processing " << task_description);
-
-                using namespace std::literals::chrono_literals;
-                std::this_thread::sleep_for(1s);
+                std::this_thread::sleep_for(default_sleep_time);
             }
             else
             {
@@ -602,61 +628,163 @@ protected:
         return res;
     }
 
-    bool processPartitionTask(TaskPartition & task_partition)
+    std::chrono::milliseconds default_sleep_time{1000};
+
+    bool tryDropPartition(TaskPartition & task_partition, const zkutil::ZooKeeperPtr & zookeeper)
     {
-        auto zookeeper = getZooKeeper();
+        String common_partition_task_path = task_partition.getCommonPartitionPath();
+        String common_partition_shards_path = task_partition.getCommonPartitionShardsPath();
+        String common_partition_is_dirty_path = task_partition.getCommonPartitionIsDirtyPath();
+        String common_partition_cleaner_path = common_partition_is_dirty_path + "/cleaner";
 
-        String partition_task_node = task_partition.getZooKeeperPath();
-        String partition_task_active_node = partition_task_node + "/active_worker";
-        String partition_task_status_node = partition_task_node + "/state";
-
-        /// Load balancing
-        auto worker_node_holder = createWorkerNodeAndWaitIfNeed(zookeeper, partition_task_node);
-
-        /// Create ephemeral node to mark that we are active
-        zookeeper->createAncestors(partition_task_active_node);
-        zkutil::EphemeralNodeHolderPtr partition_task_node_holder;
+        zkutil::EphemeralNodeHolder::Ptr cleaner_holder;
         try
         {
-            partition_task_node_holder = zkutil::EphemeralNodeHolder::create(partition_task_active_node, *zookeeper, host_id);
+            cleaner_holder = zkutil::EphemeralNodeHolder::create(common_partition_cleaner_path, *zookeeper, host_id);
         }
-        catch (const zkutil::KeeperException & e)
+        catch (zkutil::KeeperException & e)
         {
             if (e.code == ZNODEEXISTS)
             {
-                LOG_DEBUG(log, "Someone is already processing " << partition_task_node);
+                LOG_DEBUG(log, "Partition " << task_partition.name << " is cleaning now by somebody, sleep");
+                std::this_thread::sleep_for(default_sleep_time);
                 return false;
             }
 
             throw;
         }
 
+        zkutil::Stat stat;
+        if (zookeeper->exists(common_partition_shards_path, &stat))
+        {
+            if (stat.numChildren != 0)
+            {
+                LOG_DEBUG(log, "Partition " << task_partition.name << " contains " << stat.numChildren << " active workers, sleep");
+                std::this_thread::sleep_for(default_sleep_time);
+                return false;
+            }
+        }
+
+        /// Remove all status nodes
+        zookeeper->tryRemoveRecursive(common_partition_shards_path);
+
+        String query = "ALTER TABLE " + getDatabaseDotTable(task_partition.task_shard.task_table.table_push)
+                       + " DROP PARTITION " + task_partition.name;
+        ClusterPtr cluster_push = task_partition.task_shard.task_table.cluster_push;
+
+        LOG_DEBUG(log, "Execute distributed DROP PARTITION: " << query);
+        size_t num_shards = executeQueryOnOneReplicaAtLeast(cluster_push, nullptr, query, &task_cluster->settings_push);
+
+        if (num_shards < cluster_push->getShardCount())
+        {
+            LOG_DEBUG(log, "DROP PARTITION wasn't successfully executed on " << cluster_push->getShardCount() - num_shards << " shards");
+            return false;
+        }
+
+        /// Remove the locking node
+        zookeeper->remove(common_partition_is_dirty_path);
+        return true;
+    }
+
+    bool processPartitionTask(TaskPartition & task_partition)
+    {
         TaskShard & task_shard = task_partition.task_shard;
         TaskTable & task_table = task_shard.task_table;
 
-        /// We need to update table definitions for each part, it could be changed after ALTER
+        auto zookeeper = getZooKeeper();
+        int32_t code;
 
+        String common_partition_is_dirty_path = task_partition.getCommonPartitionIsDirtyPath();
+        String partition_task_is_active_path = task_partition.getActiveWorkerPath();
+        String partition_status_path = task_partition.getShardStatusPath();
+
+        /// Load balancing
+        auto worker_node_holder = createWorkerNodeAndWaitIfNeed(zookeeper, partition_status_path);
+
+        /// Do not start if partition is dirty, try to clean it
+        if (zookeeper->exists(common_partition_is_dirty_path))
+        {
+            LOG_DEBUG(log, "Partition " << task_partition.name << " is dirty and will be dropped and refilled");
+
+            try
+            {
+                tryDropPartition(task_partition, zookeeper);
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log, "An error occurred while clean partition");
+                return false;
+            }
+
+            return false;
+        }
+
+        /// Create ephemeral node to mark that we are active
+        zookeeper->createAncestors(partition_task_is_active_path);
+        zkutil::EphemeralNodeHolderPtr partition_task_node_holder;
+        try
+        {
+            partition_task_node_holder = zkutil::EphemeralNodeHolder::create(partition_task_is_active_path, *zookeeper, host_id);
+        }
+        catch (const zkutil::KeeperException & e)
+        {
+            if (e.code == ZNODEEXISTS)
+            {
+                LOG_DEBUG(log, "Someone is already processing " << partition_task_is_active_path);
+                return false;
+            }
+
+            throw;
+        }
+
+        /// Exit if task has been already processed, create blocking node if it is abandoned
+        {
+            String status_data;
+            code = zookeeper->tryGet(partition_status_path, status_data);
+            if (code == ZOK)
+            {
+                TaskStateWithOwner status = TaskStateWithOwner::fromString(status_data);
+                if (status.state == TaskState::Finished)
+                {
+                    LOG_DEBUG(log, "Task " << partition_status_path << " has been successfully executed by " << status.owner);
+                    return true;
+                }
+
+                // Task is abandoned, initialize DROP PARTITON
+                LOG_DEBUG(log, "Task " << partition_status_path << " has not been successfully finished by " << status.owner);
+                zookeeper->create(common_partition_is_dirty_path, partition_status_path, zkutil::CreateMode::Persistent);
+
+                return false;
+            }
+            if (code != ZNONODE)
+                throw zkutil::KeeperException(code, partition_status_path);
+        }
+
+        zookeeper->createAncestors(partition_status_path);
+
+        /// We need to update table definitions for each part, it could be changed after ALTER
         String create_query_pull_str = getRemoteCreateTable(task_table.table_pull, *task_shard.connection_entry,
                                                             &task_cluster->settings_pull);
 
         ParserCreateQuery parser_create_query;
         ASTPtr create_query_pull_ast = parseQuery(parser_create_query, create_query_pull_str);
 
-        DatabaseAndTableName table_pull(working_database_name, ".pull." + task_table.name_in_config);
+        DatabaseAndTableName table_shard(working_database_name, ".read_shard." + task_table.name_in_config);
         DatabaseAndTableName table_split(working_database_name, ".split." + task_table.name_in_config);
 
-        String table_pull_cluster_name = ".pull." + task_table.cluster_pull_name;
+        /// Create special cluster with single shard
+        String shard_read_cluster_name = ".read_shard." + task_table.cluster_pull_name;
         size_t current_shard_index = task_shard.info.shard_num - 1;
         ClusterPtr cluster_pull_current_shard = task_table.cluster_pull->getClusterWithSingleShard(current_shard_index);
-        context.setCluster(table_pull_cluster_name, cluster_pull_current_shard);
+        context.setCluster(shard_read_cluster_name, cluster_pull_current_shard);
 
-        auto storage_pull_ast = createASTStorageDistributed(table_pull_cluster_name, task_table.table_pull.first, task_table.table_pull.second);
+        auto storage_shard_ast = createASTStorageDistributed(shard_read_cluster_name, task_table.table_pull.first, task_table.table_pull.second);
         const auto & storage_split_ast = task_table.engine_proxy_ast;
 
-        auto create_table_pull_ast = rewriteCreateQueryStorage(create_query_pull_ast, table_pull, storage_pull_ast);
-        auto create_table_split_ast = rewriteCreateQueryStorage(create_query_pull_ast, table_split, storage_split_ast);
+        auto create_table_pull_ast = rewriteCreateQueryStorage(create_query_pull_ast, table_shard, storage_shard_ast);
+        auto create_table_split_ast = rewriteCreateQueryStorage(storage_split_ast, table_split, storage_split_ast);
 
-        LOG_DEBUG(log, "Create current pull table. Query: " << queryToString(create_table_pull_ast));
+        LOG_DEBUG(log, "Create shard reading table. Query: " << queryToString(create_table_pull_ast));
         dropAndCreateLocalTable(create_table_pull_ast);
 
         LOG_DEBUG(log, "Create split table. Query: " << queryToString(create_table_split_ast));
@@ -665,81 +793,143 @@ protected:
         auto create_query_push_ast = rewriteCreateQueryStorage(create_query_pull_ast, task_table.table_push, task_table.engine_push_ast);
         LOG_DEBUG(log, "Push table create query: " << queryToString(create_query_push_ast));
 
-        TaskStateWithOwner start_state(TaskState::Started, host_id);
-        auto code = zookeeper->tryCreate(partition_task_status_node, start_state.toString(), zkutil::CreateMode::Persistent);
+        zkutil::ACLPtr acl = zookeeper->getDefaultACL();
+        zkutil::Ops ops;
+        zkutil::OpResultsPtr multi_results;
 
-        if (code == ZNODEEXISTS)
+        String start_state = TaskStateWithOwner(TaskState::Started, host_id).toString();
+        ops.clear();
+        ops.emplace_back(std::make_unique<zkutil::Op::Create>(common_partition_is_dirty_path, "", acl, zkutil::CreateMode::Persistent));
+        ops.emplace_back(std::make_unique<zkutil::Op::Remove>(common_partition_is_dirty_path, -1));
+        ops.emplace_back(std::make_unique<zkutil::Op::Create>(partition_status_path, start_state, acl, zkutil::CreateMode::Persistent));
+
+        multi_results.reset();
+        code = zookeeper->tryMulti(ops, &multi_results);
+
+        if (code != ZOK)
         {
-            auto status = TaskStateWithOwner::fromString(zookeeper->get(partition_task_status_node));
+            size_t failed_op = zkutil::getFailedOpIndex(multi_results);
 
-            if (status.state == TaskState::Finished)
+            if (failed_op == 0)
             {
-                LOG_DEBUG(log, "Task " << partition_task_node << " has been executed by " << status.owner);
-                return true;
+                LOG_DEBUG(log, "Partition " << task_partition.name << " is dirty and will be dropped and refilled");
+                return false;
             }
             else
             {
-                LOG_DEBUG(log, "Found abandoned task " << partition_task_node);
-                /// Restart shard
-                return false;
+                throw zkutil::KeeperException(code, partition_status_path);
             }
         }
-        else if (code != ZOK)
-            throw zkutil::KeeperException(code, partition_task_status_node);
 
         /// Try create table (if not exists) on each shard
         {
-            auto query_ast = create_query_push_ast->clone();
-            typeid_cast<ASTCreateQuery &>(*query_ast).if_not_exists = true;
-            String query = queryToString(query_ast);
+            auto create_push_table_if_exists_ast = create_query_push_ast->clone();
+            typeid_cast<ASTCreateQuery &>(*create_push_table_if_exists_ast).if_not_exists = true;
+            String query = queryToString(create_push_table_if_exists_ast);
 
-            LOG_DEBUG(log, "Create remote tables " << query);
-            executeQueryOnOneReplicaAtLeast(task_table.cluster_push, query_ast, query, &task_cluster->settings_push);
+            LOG_DEBUG(log, "Create remote push tables: " << query);
+            executeQueryOnOneReplicaAtLeast(task_table.cluster_push, create_push_table_if_exists_ast, query, &task_cluster->settings_push);
         }
 
-        /// Do the main action
+        /// Do the copying
         {
-            String query;
+            ASTPtr query_select_ast;
             {
-                std::stringstream ss;
-                ss << "INSERT INTO " << getDatabaseDotTable(table_split)
-                   << " SELECT * FROM " << getDatabaseDotTable(table_pull)
-                   << " WHERE (_part LIKE '" << task_partition.name << "%')";
-
+                String query;
+                query += "SELECT * FROM " + getDatabaseDotTable(table_shard);
+                query += " WHERE (_part LIKE '" + task_partition.name + "%')";
                 if (!task_table.where_condition_str.empty())
-                    ss << " AND (" + task_table.where_condition_str + ")";
+                    query += " AND (" + task_table.where_condition_str + ")";
 
-                query = ss.str();
+                ParserQuery p_query(query.data() + query.size());
+                query_select_ast = parseQuery(p_query, query);
+
+                LOG_DEBUG(log, "Executing SELECT query: " << query);
             }
 
-            LOG_DEBUG(log, "Executing query: " << query);
+            ASTPtr query_insert_ast;
+            {
+                String query;
+                query += "INSERT INTO " + getDatabaseDotTable(table_split);
+
+                ParserQuery p_query(query.data() + query.size());
+                query_insert_ast = parseQuery(p_query, query);
+
+                LOG_DEBUG(log, "Executing INSERT query: " << query);
+            }
 
             try
             {
-                Context local_context = context;
-                local_context.getSettingsRef() = task_cluster->settings_push;
+                /// Custom INSERT SELECT implementation
+                Context context_select = context;
+                context_select.getSettingsRef() = task_cluster->settings_pull;
 
-                ReadBufferFromString istr(query);
-                WriteBufferNull ostr;
-                executeQuery(istr, ostr, false, local_context, {});
+                Context context_insert = context;
+                context_insert.getSettingsRef() = task_cluster->settings_push;
+
+                InterpreterSelectQuery interpreter_select(query_select_ast, context_select);
+                BlockIO io_select = interpreter_select.execute();
+
+                InterpreterInsertQuery interpreter_insert(query_insert_ast, context_insert);
+                BlockIO io_insert = interpreter_insert.execute();
+
+                auto future_is_dirty = zookeeper->asyncExists(common_partition_is_dirty_path);
+
+                auto cancel_check = [&] ()
+                {
+                    if (zookeeper->expired())
+                        throw Exception("ZooKeeper session is expired, cancel INSERT SELECT", ErrorCodes::UNFINISHED);
+
+                    zkutil::ZooKeeper::StatAndExists status;
+                    try
+                    {
+                        status = future_is_dirty.get();
+                    }
+                    catch (zkutil::KeeperException & e)
+                    {
+                        if (!e.isTemporaryError())
+                            throw;
+                    }
+
+                    if (status.exists)
+                        throw Exception("Partition is dirty, cancel INSERT SELECT", ErrorCodes::UNFINISHED);
+
+                    future_is_dirty = zookeeper->asyncExists(common_partition_is_dirty_path);
+
+                    return false;
+                };
+
+                copyData(*io_select.in, *io_insert.out, cancel_check);
             }
             catch (...)
             {
-                tryLogCurrentException(log);
+                tryLogCurrentException(log, "An error occurred during copying, partition will be marked as dirty");
+                return false;
             }
         }
 
-        TaskStateWithOwner state_finish(TaskState::Started, host_id);
-        zkutil::Stat stat;
-        code = zookeeper->trySet(partition_task_status_node, state_finish.toString(), 0, &stat);
+        /// Change state of current partition (of current shard)
+        ///  and check that partition should not be deleted (is not dirty)
+        String state_finished = TaskStateWithOwner(TaskState::Started, host_id).toString();
+        ops.clear();
+        ops.emplace_back(std::make_unique<zkutil::Op::Create>(common_partition_is_dirty_path, "", acl, zkutil::CreateMode::Persistent));
+        ops.emplace_back(std::make_unique<zkutil::Op::Remove>(common_partition_is_dirty_path, -1));
+        ops.emplace_back(std::make_unique<zkutil::Op::SetData>(partition_status_path, state_finished, 0));
 
-        if (code == ZBADVERSION)
+        multi_results.reset();
+        code = zookeeper->tryMulti(ops, &multi_results);
+
+        if (code != ZOK)
         {
-            LOG_DEBUG(log, "Someone made the node abandoned. Will refill partition");
+            size_t failed_op = zkutil::getFailedOpIndex(multi_results);
+
+            if (failed_op == 0)
+                LOG_DEBUG(log, "Partition " << task_partition.name << " becomes dirty and will be dropped and refilled");
+            else if (failed_op == 2)
+                LOG_DEBUG(log, "Someone made the node abandoned. Will refill partition");
+
             return false;
         }
-        else if (code != ZOK)
-            throw zkutil::KeeperException(code, partition_task_status_node);
 
         return true;
     }
@@ -810,11 +1000,21 @@ protected:
         return res;
     }
 
-    size_t executeQueryOnOneReplicaAtLeast(const ClusterPtr & cluster, const ASTPtr & query_ast, const String & query,
+    size_t executeQueryOnOneReplicaAtLeast(const ClusterPtr & cluster, const ASTPtr & query_ast_, const String & query,
                                          const Settings * settings = nullptr) const
     {
         auto num_shards = cluster->getShardsInfo().size();
         std::vector<size_t> per_shard_num_sucessful_replicas(num_shards, 0);
+
+        ASTPtr query_ast;
+        if (query_ast_ == nullptr)
+        {
+            ParserQuery p_query(query.data() + query.size());
+            query_ast = parseQuery(p_query, query);
+        }
+        else
+            query_ast = query_ast_;
+
 
         /// We need to execute query on one replica at least
         auto do_for_shard = [&] (size_t shard_index)
