@@ -34,3 +34,6 @@
 [submodule "contrib/boost"]
 	path = contrib/boost
 	url = https://github.com/ClickHouse-Extras/boost.git
+[submodule "contrib/parquet-cpp"]
+	path = contrib/parquet-cpp
+	url = https://github.com/apache/parquet-cpp/
