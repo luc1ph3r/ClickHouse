@@ -29,4 +29,4 @@ endif ()
 
 endif ()
 
-message (STATUS "Using librdkafka=${USE_PARQUET}: ${PARQUET_INCLUDE_DIR} : ${PARQUET_LIBRARY}")
+message (STATUS "Using libparquet=${USE_PARQUET}: ${PARQUET_INCLUDE_DIR} : ${PARQUET_LIBRARY}")

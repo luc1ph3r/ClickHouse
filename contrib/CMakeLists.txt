@@ -152,5 +152,5 @@ if (USE_INTERNAL_POCO_LIBRARY)
 endif ()
 
 if (USE_INTERNAL_PARQUET_LIBRARY)
-  add_subdirectory (parquet-cpp)
+    add_subdirectory (parquet-cpp)
 endif ()
