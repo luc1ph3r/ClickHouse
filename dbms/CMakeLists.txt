@@ -211,12 +211,18 @@ if (USE_RDKAFKA)
     endif ()
 endif ()
 
-if (USE_PARQUET)
-    target_link_libraries (dbms ${PARQUET_LIBRARY})
+# if (USE_PARQUET)
+    MESSAGE ("PARQUET_STATIC_LIB: ${PARQUET_STATIC_LIB}")
+    MESSAGE ("ARROW_STATIC_LIB: ${ARROW_STATIC_LIB}")
+
+    MESSAGE ("PARQUET_INCLUDE_DIR: ${PARQUET_INCLUDE_DIR}")
+    MESSAGE ("ARROW_INCLUDE_DIR: ${ARROW_INCLUDE_DIR}")
+
+    target_link_libraries (dbms PRIVATE ${PARQUET_SHARED_LIB} ${ARROW_SHARED_LIB})
     if (NOT USE_INTERNAL_PARQUET_LIBRARY)
-        target_include_directories (dbms BEFORE PRIVATE ${PARQUET_INCLUDE_DIR})
+        target_include_directories (dbms BEFORE PRIVATE ${PARQUET_INCLUDE_DIR} ${ARROW_INCLUDE_DIR})
     endif ()
-endif ()
+# endif ()
 
 target_link_libraries (dbms
     Threads::Threads

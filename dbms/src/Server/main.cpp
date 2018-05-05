@@ -34,6 +34,9 @@ int mainEntryClickHouseBenchmark(int argc, char ** argv);
 #if ENABLE_CLICKHOUSE_PERFORMANCE
 int mainEntryClickHousePerformanceTest(int argc, char ** argv);
 #endif
+#if ENABLE_CLICKHOUSE_TEST
+int mainEntryClickHouseTest(int argc, char ** argv);
+#endif
 #if ENABLE_CLICKHOUSE_TOOLS
 int mainEntryClickHouseExtractFromConfig(int argc, char ** argv);
 int mainEntryClickHouseCompressor(int argc, char ** argv);
@@ -71,6 +74,9 @@ std::pair<const char *, MainFunc> clickhouse_applications[] =
 #endif
 #if ENABLE_CLICKHOUSE_PERFORMANCE
     {"performance-test", mainEntryClickHousePerformanceTest},
+#endif
+#if ENABLE_CLICKHOUSE_TEST
+    {"test", mainEntryClickHouseTest},
 #endif
 #if ENABLE_CLICKHOUSE_TOOLS
     {"extract-from-config", mainEntryClickHouseExtractFromConfig},

@@ -9,6 +9,7 @@ option (ENABLE_CLICKHOUSE_CLIENT "Enable client" ${ENABLE_CLICKHOUSE_ALL})
 option (ENABLE_CLICKHOUSE_LOCAL "Enable local" ${ENABLE_CLICKHOUSE_ALL})
 option (ENABLE_CLICKHOUSE_BENCHMARK "Enable benchmark" ${ENABLE_CLICKHOUSE_ALL})
 option (ENABLE_CLICKHOUSE_PERFORMANCE "Enable performance" ${ENABLE_CLICKHOUSE_ALL})
+option (ENABLE_CLICKHOUSE_TEST "Enable test" ${ENABLE_CLICKHOUSE_ALL})
 option (ENABLE_CLICKHOUSE_TOOLS "Enable tools: compressor format extract-from-config-lib" ${ENABLE_CLICKHOUSE_ALL})
 option (ENABLE_CLICKHOUSE_COPIER "Enable copier" ${ENABLE_CLICKHOUSE_ALL})
 
@@ -48,6 +49,10 @@ target_include_directories (clickhouse-benchmark-lib PRIVATE ${PCG_RANDOM_INCLUD
 add_library (clickhouse-performance-test-lib ${SPLIT_SHARED} PerformanceTest.cpp)
 target_link_libraries (clickhouse-performance-test-lib clickhouse_common_io dbms ${Boost_PROGRAM_OPTIONS_LIBRARY})
 target_include_directories (clickhouse-performance-test-lib PRIVATE ${PCG_RANDOM_INCLUDE_DIR})
+
+add_library (clickhouse-test-lib ${SPLIT_SHARED} Test.cpp)
+target_link_libraries (clickhouse-test-lib clickhouse_common_io dbms ${Boost_PROGRAM_OPTIONS_LIBRARY})
+target_include_directories (clickhouse-test-lib PRIVATE ${PCG_RANDOM_INCLUDE_DIR})
 
 add_library (clickhouse-compressor-lib ${SPLIT_SHARED} Compressor.cpp)
 target_link_libraries (clickhouse-compressor-lib clickhouse_common_io ${Boost_PROGRAM_OPTIONS_LIBRARY})
@@ -124,6 +129,9 @@ else ()
     if (ENABLE_CLICKHOUSE_PERFORMANCE)
         target_link_libraries (clickhouse clickhouse-performance-test-lib)
     endif ()
+    if (ENABLE_CLICKHOUSE_TEST)
+        target_link_libraries (clickhouse clickhouse-test-lib)
+    endif ()
     if (ENABLE_CLICKHOUSE_TOOLS)
     target_link_libraries (clickhouse
         clickhouse-extract-from-config-lib
@@ -156,11 +164,19 @@ else ()
         install (FILES ${CMAKE_CURRENT_BINARY_DIR}/clickhouse-benchmark DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT clickhouse)
         list(APPEND CLICKHOUSE_BUNDLE clickhouse-benchmark)
     endif ()
+
     if (ENABLE_CLICKHOUSE_PERFORMANCE)
         add_custom_target (clickhouse-performance-test ALL COMMAND ${CMAKE_COMMAND} -E create_symlink clickhouse clickhouse-performance-test DEPENDS clickhouse)
         install (FILES ${CMAKE_CURRENT_BINARY_DIR}/clickhouse-performance-test DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT clickhouse)
         list(APPEND CLICKHOUSE_BUNDLE clickhouse-performance-test)
     endif ()
+
+    if (ENABLE_CLICKHOUSE_TEST)
+        add_custom_target (clickhouse-test ALL COMMAND ${CMAKE_COMMAND} -E create_symlink clickhouse clickhouse-test DEPENDS clickhouse)
+        install (FILES ${CMAKE_CURRENT_BINARY_DIR}/clickhouse-test DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT clickhouse)
+        list(APPEND CLICKHOUSE_BUNDLE clickhouse-test)
+    endif ()
+
     if (ENABLE_CLICKHOUSE_TOOLS)
         add_custom_target (clickhouse-extract-from-config ALL COMMAND ${CMAKE_COMMAND} -E create_symlink clickhouse clickhouse-extract-from-config DEPENDS clickhouse)
         add_custom_target (clickhouse-compressor ALL COMMAND ${CMAKE_COMMAND} -E create_symlink clickhouse clickhouse-compressor DEPENDS clickhouse)
